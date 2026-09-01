@@ -79,15 +79,12 @@ on rank 3 only, with the head reporting nothing more useful than "WorkerProc
 initialization failed". Two relaunches and a full fleet reboot did not help, because
 none of them changed the pin.
 
-The launcher now reads the index out of sysfs at launch and keeps the pinned value only
-as a fallback. Detection is six lines, it runs before the container starts, and it
-prints what it chose:
+The launcher now reads the index out of sysfs before it starts the container, and keeps
+the pinned value only as a fallback. It is six lines, and it prints what it picked:
 
 ```
 using NCCL_IB_GID_INDEX=3
 ```
-
-Set it and forget it beats checking it after every reboot.
 
 ### 2. The `persistent_topk` patch is mandatory, and short tests will not catch it
 
@@ -199,11 +196,11 @@ Two systemd units, both in [`ops/`](ops/):
 Recovery takes about 15 minutes, so raise `FAIL_THRESHOLD` before pointing it at
 anything latency-sensitive.
 
-One trap worth knowing if you ever run something else on the same nodes: an enabled
-supervisor comes back on its own after a reboot. Ours quietly re-armed in the middle of
-an unrelated deployment and spent several boots fighting it for the master port and the
-memory, and the failures looked like they belonged to the other workload. Before you
-trust a long debugging session on shared hardware:
+An enabled supervisor also comes back on its own after a reboot, which matters if you
+ever run something else on these nodes. Ours re-armed in the middle of an unrelated
+deployment and spent several boots fighting it for the master port and the memory, and
+the failures looked like they belonged to the other workload. Before you trust a long
+debugging session on shared hardware:
 
 ```bash
 systemctl list-units | grep -i <anything model-shaped>
