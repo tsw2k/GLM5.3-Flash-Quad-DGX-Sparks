@@ -1,0 +1,12 @@
+[Unit]
+Description=GB10 page-cache flusher (required during vLLM weight load)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/home/mtxc/glm53/flusher-unconditional.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

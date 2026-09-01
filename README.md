@@ -70,6 +70,25 @@ watching the log: high utilisation with low power means a hung collective, every
 
 Fix: set it per rank ([`launch-glm53-tp4.sh`](launch-glm53-tp4.sh)).
 
+**Update, after a day of reboots: a per-rank pin goes stale too.** The table above was
+true when we wrote it. We rebooted the fleet a few times for unrelated reasons, and
+spark-04's RoCEv2 GID moved from index 4 back to 3 — so the pin that had been correct
+became a pin to an empty slot. The symptom is not the clean `local GID ::` error you get
+from a wrong index at cabling time; it is `NCCL error: unhandled system error` at init,
+on rank 3 only, with the head reporting nothing more useful than "WorkerProc
+initialization failed". Two relaunches and a full fleet reboot did not help, because
+none of them changed the pin.
+
+The launcher now reads the index out of sysfs at launch and keeps the pinned value only
+as a fallback. Detection is six lines, it runs before the container starts, and it
+prints what it chose:
+
+```
+using NCCL_IB_GID_INDEX=3
+```
+
+Set it and forget it beats checking it after every reboot.
+
 ### 2. The `persistent_topk` patch is mandatory, and short tests will not catch it
 
 The kernel wants ≥128 KB shared memory per block; GB10 has 101 376 B. Past roughly
@@ -165,6 +184,31 @@ speculative decoding one chunk carries several tokens. Ask for usage instead:
 and divide `completion_tokens` by the time from first token to last.
 [`scripts/bench.py`](scripts/bench.py) does it correctly.
 
+## Running it as a service
+
+Two systemd units, both in [`ops/`](ops/):
+
+- `glm53-flusher.service` runs the unconditional page-cache flusher. GB10's NVRM
+  allocator needs it during weight load, and leaving it running costs nothing.
+- `glm53-fleet.service` runs the watchdog: it probes `/health` every 60 s and, after
+  three consecutive failures, tears every rank down, runs the memory ritual, and
+  relaunches worker-first. vLLM v1 cannot revive a dead engine core, and Docker restart
+  policies make it worse — a headless worker exits 0 when the head dies, so
+  `on-failure` never fires, and the dead head often does not exit at all.
+
+Recovery takes about 15 minutes, so raise `FAIL_THRESHOLD` before pointing it at
+anything latency-sensitive.
+
+One trap worth knowing if you ever run something else on the same nodes: an enabled
+supervisor comes back on its own after a reboot. Ours quietly re-armed in the middle of
+an unrelated deployment and spent several boots fighting it for the master port and the
+memory, and the failures looked like they belonged to the other workload. Before you
+trust a long debugging session on shared hardware:
+
+```bash
+systemctl list-units | grep -i <anything model-shaped>
+```
+
 ## What is in here
 
 | Path | |
@@ -174,6 +218,9 @@ and divide `completion_tokens` by the time from first token to last.
 | [`scripts/bench.py`](scripts/bench.py) | single-stream benchmark that counts real tokens |
 | [`scripts/bench-concurrency.py`](scripts/bench-concurrency.py) | concurrency sweep |
 | [`scripts/fabric-bench.sh`](scripts/fabric-bench.sh) | RDMA acceptance matrix before you blame the model |
+| [`ops/fleet_watchdog.sh`](ops/fleet_watchdog.sh) | health probe plus orchestrated worker-first relaunch |
+| [`ops/flusher-unconditional.sh`](ops/flusher-unconditional.sh) | the page-cache flusher, unconditional by design |
+| [`ops/glm53-fleet.service`](ops/glm53-fleet.service), [`ops/glm53-flusher.service`](ops/glm53-flusher.service) | systemd units for both |
 | [`docs/hardware-notes.md`](docs/hardware-notes.md) | GX10 socket-direct layout, thermals, bandwidth ceilings |
 
 ## Credits

@@ -1,0 +1,14 @@
+[Unit]
+Description=GLM-5.3-Flash TP4 fleet supervisor (health probe + orchestrated relaunch)
+After=network-online.target docker.service glm53-flusher.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=mtxc
+ExecStart=/home/mtxc/glm53/fleet_watchdog.sh
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target
