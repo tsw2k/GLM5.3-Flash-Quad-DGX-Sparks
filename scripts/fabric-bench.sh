@@ -17,7 +17,9 @@ HCA_B=roceP2p1s0f1
 DUR=10
 OUT=$(mktemp -d)
 
-mgmt()  { case $1 in spark-01) echo 10.81.16.10;; spark-02) echo 10.81.16.11;; spark-03) echo 10.81.16.12;; spark-04) echo 10.81.16.13;; esac; }
+# Management addresses: edit for your fleet. Orchestration goes over mgmt on purpose,
+# so a flapping compute rail cannot cut the benchmark off from the nodes.
+mgmt()  { case $1 in spark-01) echo 192.0.2.10;; spark-02) echo 192.0.2.11;; spark-03) echo 192.0.2.12;; spark-04) echo 192.0.2.13;; esac; }
 raila() { case $1 in spark-01) echo 10.77.1.11;;  spark-02) echo 10.77.1.12;;  spark-03) echo 10.77.1.13;;  spark-04) echo 10.77.1.14;;  esac; }
 railb() { case $1 in spark-01) echo 10.77.2.11;;  spark-02) echo 10.77.2.12;;  spark-03) echo 10.77.2.13;;  spark-04) echo 10.77.2.14;;  esac; }
 

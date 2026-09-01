@@ -12,30 +12,69 @@ fabric that overheated itself, and a silent NCCL hang that looks exactly like ha
 ## Results
 
 Fabric: Arista 7060CX-32S, 100G, single rail, passive DAC. Model:
-`LibertAIDAI/GLM-5.3-Flash-NVFP4`, TP=4, fp8 KV-cache, MTP-4 speculative decoding,
+`RedHatAI/GLM-5.3-Flash-NVFP4`, TP=4, fp8 KV-cache, DFlash2 speculative decoding at k=7,
 `--enforce-eager`, `--max-model-len 1048576`, KV 24 GiB/rank.
 
 | Content regime | TTFT | Decode |
 |---|---|---|
-| structured (counting, lists) | 0.202 s | **64.0 tok/s** |
-| code generation | 0.198 s | **46.9 tok/s** |
-| freeform prose | 0.195 s | **33.4 tok/s** |
+| structured (counting, lists) | 0.254 s | **76.0 tok/s** |
+| code generation | 0.187 s | **71.3 tok/s** |
+| freeform prose | 0.185 s | **31.6 tok/s** |
 
 | Concurrency | Aggregate | Per stream |
 |---|---|---|
-| 1 | 44.2 tok/s | 44.2 |
-| 2 | 79.7 tok/s | 39.8 |
-| 8 | **114.0 tok/s** | 14.3 |
+| 1 | 65.4 tok/s | 65.4 |
+| 2 | 104.2 tok/s | 52.1 |
+| 8 | 99.9 tok/s | 12.5 |
 
-KV pool 3,774,873 tokens (3.6x concurrent full-1M-context requests). Speculative decode
-acceptance 87 to 95.6%.
+KV pool 3,895,606 tokens, 3.72x a full 1M-token context. DFlash2 accepts 5.43 of 7 draft
+tokens on average.
 
-These match the reference build's numbers, which were measured on a 200G fabric. On this
-model, decode is not fabric-bound, which is worth knowing before anyone buys faster
-switching to make tokens come out quicker. Where more fabric would help is prefill of
-long contexts and heavy multi-tenant load.
+The first run of this stack used the ModelOpt checkpoint and MTP-4 drafting: 64.0
+structured, 46.9 on code, 33.4 on prose. Changing the checkpoint and the drafter moved
+code generation by half. Prose did not move at all, which is what you would expect, since
+a drafter only wins where the next tokens are predictable. The C=8 number went the wrong
+way and we have not worked out why.
 
-## The five things that cost us a day
+Both sets of numbers match the reference build, which was measured on a 200G fabric. So
+decode here is not fabric-bound. Worth knowing before anyone buys faster switching to make
+tokens come out quicker. More fabric would help with prefill of long contexts and with
+heavy multi-tenant load, not with this.
+
+## The things that cost us a day
+
+### 0. The obvious checkpoint is the one that corrupts tokens
+
+We served `LibertAIDAI/GLM-5.3-Flash-NVFP4` for a day before upstream flagged the
+problem. ModelOpt-quantized NVFP4 builds emit occasional corrupted token IDs
+([vLLM #54150](https://github.com/vllm-project/vllm/issues/54150)). In English you barely
+notice. Land one inside a tool-call block and the parser loses the thread, after which
+generation can lock into a repetition loop.
+
+`RedHatAI/GLM-5.3-Flash-NVFP4` is a compressed-tensors quant of the same architecture and
+drops straight in: same flags, same launcher, only the path changes. It also loads faster,
+11 large shards instead of 120 small ones.
+
+Upstream measured 4, 9 and 8 replacement characters over three runs on ModelOpt. We ran
+the same probe after switching and got 0, 0, 0:
+
+```python
+# Korean prompt, temperature 0, three passes, count U+FFFD in the output.
+# Latin script hides this; scripts with multi-byte codepoints do not.
+prompt = "한국어로 인공지능의 미래에 대해 200자 정도로 설명해 주세요."
+bad = response["choices"][0]["message"]["content"].count("\ufffd")
+```
+
+The trade is real. RedHatAI quantizes activations too (W4A4 against W4A16), so hard
+reasoning loses a little. We took it. Correct output beats slightly better reasoning.
+
+Check what you are actually running:
+
+```bash
+python3 -c "import json;print(json.load(open('config.json'))['quantization_config']['quant_method'])"
+# compressed-tensors  good
+# modelopt            swap it
+```
 
 ### 1. `NCCL_IB_GID_INDEX` is per node, and getting it wrong hangs silently
 
@@ -109,22 +148,30 @@ proves nothing, because the crash happens during decode steps rather than prefil
 29,442 tokens in and 218 out, then 39,625 and 219. Both survived and the engine stayed
 healthy.
 
-### 3. Building the image: the patch chain is not v1 to v8
+### 3. Building the image, which you no longer have to do
 
-The published `radixark/vllm-glm53-flash:sm121-v8` image is private, so we rebuilt it. The
-Dockerfiles are numbered v1 to v9 and the README says "apply v1->v8 in order", but v2 is
-a debug build (a NaN localiser) and is not part of the chain. Follow the `FROM` lines
-instead:
+Upstream now publishes the image, anonymously pullable:
+
+```bash
+docker pull ghcr.io/tonyd2wild/vllm-glm53-flash:sm121-v11-dflash2
+```
+
+Pull it on one node. Four nodes pulling 31 GB at once will hit GHCR rate limits, and
+Docker Hub will refuse anonymous pulls of the base image long before that.
+
+The rest of this section is history, and still useful if you ever need to rebuild. The
+Dockerfiles are numbered v1 to v9, and the README says to apply v1 through v8 in order,
+but v2 is a debug build, a NaN localiser, and is not in the chain. Follow the `FROM` lines:
 
 ```
 base -> v1 -> v3 -> v4 -> v5 -> v6 -> v7 -> v8
-        │      │     │     │     │     │     └ fp8 KV for the FA2 NoPE path
-        │      │     │     │     │     └ uninitialised top-k memory
-        │      │     │     │     └ PDL race
-        │      │     │     └ restore cutlass-dsl 4.6.2
-        │      │     └ restore NCCL 2.30.7 (the FlashInfer nightly downgrades it)
-        │      └ FlashInfer 0.6.18 (0.6.17 gives NaN on 64 to 256 row batches)
-        └ extend the SM90 NoPE-MLA backend to capability 12
+        |      |     |     |     |     |     ` fp8 KV for the FA2 NoPE path
+        |      |     |     |     |     ` uninitialised top-k memory
+        |      |     |     |     ` PDL race
+        |      |     |     ` restore cutlass-dsl 4.6.2
+        |      |     ` restore NCCL 2.30.7, the FlashInfer nightly downgrades it
+        |      ` FlashInfer 0.6.18, since 0.6.17 produces NaN on 64 to 256-row batches
+        ` extend the SM90 NoPE-MLA backend to capability 12
 ```
 
 [`scripts/build-sm121.sh`](scripts/build-sm121.sh) does this.
@@ -169,6 +216,59 @@ congestion.
 
 **Reboot the node with the cable already inserted.** That takes it from 13.4 to 98 Gbps
 with no config change. Our rule now: recabled means rebooted.
+
+## Moving 180 GB around without wasting the fabric
+
+Both the weights and the image have to reach every node, and the obvious ways are slow
+for the same reason. rsync over SSH and `docker save | ssh` both encrypt, and AES on the
+GB10's ARM cores tops out near 1 Gbps. On a 100G fabric that is one percent of the wire.
+
+The rails are an isolated L2 segment with no routing, so there is nothing to protect the
+traffic from. We run an rsync daemon instead, read-only, restricted to the rail subnets:
+
+```ini
+# /etc/rsyncd.conf
+uid = mtxc
+gid = mtxc
+use chroot = no
+read only = yes
+hosts allow = 10.77.1.0/24 10.77.2.0/24
+hosts deny = *
+
+[models]
+path = /var/tmp
+```
+
+Measured on one 4 GiB shard between two nodes: 1977 MB/s, against roughly 1 Gbps over
+SSH. The image goes the same way, `docker save` to a tar under the module root, then each
+node pulls it and runs `docker load`. It costs 31 GB of scratch space and one extra
+write-read cycle, and it is still far quicker than encrypting the same bytes.
+
+## The supervisor will fight you during maintenance
+
+We run a watchdog that probes `/health` and rebuilds the fleet when the engine dies,
+because vLLM cannot recover a dead engine core and Docker restart policies do not help:
+headless workers exit 0 when the head dies, so `on-failure` never fires, and the dead head
+often does not exit at all.
+
+It is the right tool and it will still ruin your afternoon. Halfway through swapping the
+image and the checkpoint, it saw `/health` fail, decided the fleet was down, tore down the
+containers we had just started by hand, and relaunched from its own configuration. That
+configuration still named the previous launcher, which an upstream pull had deleted on the
+head node. We ended up with three workers on the old stack and no head at all, which is
+worse than either state we were moving between.
+
+Stop it before you touch anything:
+
+```bash
+sudo systemctl stop glm53-fleet
+# do the work, verify a real launch
+sudo systemctl start glm53-fleet
+```
+
+And after every upstream pull, re-check the four things the watchdog keeps its own copy
+of: the launcher path, the node map, the SSH key, and the health URL. Ours pointed at a
+file that no longer existed and nothing warned us.
 
 ## Bonus: how not to measure decode speed
 
