@@ -266,6 +266,9 @@ sudo systemctl stop glm53-fleet
 sudo systemctl start glm53-fleet
 ```
 
+For shorter work, `touch ~/.fleet_watchdog.pause` pauses it without stopping the unit;
+`rm` it to resume.
+
 And after every upstream pull, re-check the four things the watchdog keeps its own copy
 of: the launcher path, the node map, the SSH key, and the health URL. Ours pointed at a
 file that no longer existed and nothing warned us.
@@ -289,14 +292,24 @@ Two systemd units, both in [`ops/`](ops/):
 
 - `glm53-flusher.service` runs the unconditional page-cache flusher. GB10's NVRM
   allocator needs it during weight load, and leaving it running costs nothing.
-- `glm53-fleet.service` runs the watchdog: it probes `/health` every 60 s and, after
-  three consecutive failures, tears every rank down, runs the memory ritual, and
-  relaunches worker-first. vLLM v1 cannot revive a dead engine core, and Docker restart
+- `glm53-fleet.service` runs the watchdog. Every 60 s it checks that every rank's
+  container is running, probes `/health`, and sends a one-token canary request. After
+  three consecutive failures it tears every rank down, runs the memory ritual, and
+  relaunches worker-first; after three failed relaunches in a row it gives up and
+  writes `~/.fleet_watchdog.gaveup` instead of looping. vLLM v1 cannot revive a dead engine core, and Docker restart
   policies make it worse, since a headless worker exits 0 when the head dies so
   `on-failure` never fires, and the dead head often does not exit at all.
 
 Recovery takes about 15 minutes, so raise `FAIL_THRESHOLD` before pointing it at
 anything latency-sensitive.
+
+`/health` alone is not enough. In a failover test on DeepSeek-V4.1-Flash (same vLLM
+multi-node executor, same four nodes), killing one worker left the head answering
+`/health` with 200 and logging nothing, while client requests hung without a reply until
+an NCCL timeout took the head down about six minutes later. The head is blocked in a
+collective. The per-rank container check catches a dead worker within one probe, and the
+canary catches a stuck engine that still looks healthy. This was measured on V4.1, not
+on GLM-5.3; the mechanism is the same.
 
 An enabled supervisor also comes back on its own after a reboot, which matters if you
 ever run something else on these nodes. Ours re-armed in the middle of an unrelated
@@ -317,7 +330,7 @@ systemctl list-units | grep -i <anything model-shaped>
 | [`scripts/bench.py`](scripts/bench.py) | single-stream benchmark that counts real tokens |
 | [`scripts/bench-concurrency.py`](scripts/bench-concurrency.py) | concurrency sweep |
 | [`scripts/fabric-bench.sh`](scripts/fabric-bench.sh) | RDMA acceptance matrix before you blame the model |
-| [`ops/fleet_watchdog.sh`](ops/fleet_watchdog.sh) | health probe plus orchestrated worker-first relaunch |
+| [`ops/fleet_watchdog.sh`](ops/fleet_watchdog.sh) | per-rank, health and canary probes plus orchestrated worker-first relaunch |
 | [`ops/flusher-unconditional.sh`](ops/flusher-unconditional.sh) | the page-cache flusher, unconditional by design |
 | [`ops/glm53-fleet.service`](ops/glm53-fleet.service), [`ops/glm53-flusher.service`](ops/glm53-flusher.service) | systemd units for both |
 | [`docs/hardware-notes.md`](docs/hardware-notes.md) | GX10 socket-direct layout, thermals, bandwidth ceilings |
